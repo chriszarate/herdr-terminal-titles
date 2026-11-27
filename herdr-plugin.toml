@@ -1,4 +1,4 @@
-id = "chriszarate.titles"
+id = "chriszarate.terminal-titles"
 name = "Terminal titles"
 version = "0.1.0"
 min_herdr_version = "0.9.5"
@@ -29,7 +29,7 @@ on = "tab.focused"
 command = ["./bin/herdr-titles", "watchdog"]
 
 # Run one sync pass by hand:
-#   herdr plugin action invoke chriszarate.titles.sync
+#   herdr plugin action invoke chriszarate.terminal-titles.sync
 [[actions]]
 id = "sync"
 title = "Terminal titles: sync tab labels now"

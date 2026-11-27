@@ -37,7 +37,7 @@ watchdog`, which starts a new daemon if the old one has died. The daemon also
 watches its own binary and restarts itself after a rebuild.
 
 The daemon has no stderr. It writes errors to `watch.<session>.log` in the
-plugin state directory (`~/.local/state/herdr/plugins/chriszarate.titles/`).
+plugin state directory (`~/.local/state/herdr/plugins/chriszarate.terminal-titles/`).
 
 ## Install
 

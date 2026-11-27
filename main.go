@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 )
 
-const pluginID = "chriszarate.titles"
+const pluginID = "chriszarate.terminal-titles"
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
