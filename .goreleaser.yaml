@@ -1,0 +1,26 @@
+# The plugin supports Linux and macOS only (see `platforms` in
+# herdr-plugin.toml). watch.go uses syscall.Flock and Setsid, which do not
+# exist on Windows, so the default goreleaser targets fail to build.
+version: 2
+
+builds:
+  - binary: herdr-titles
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats: [binary]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native

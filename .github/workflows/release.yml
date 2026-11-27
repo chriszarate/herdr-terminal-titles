@@ -16,8 +16,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # fetch-or-build.sh derives the download URL from the manifest version,
-      # so a tag that doesn't match it would publish assets no installer finds.
       - name: Verify tag matches manifest version
         run: |
           tag="${GITHUB_REF_NAME#v}"
