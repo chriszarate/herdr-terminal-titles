@@ -1,6 +1,6 @@
 id = "chriszarate.terminal-titles"
 name = "Terminal titles"
-version = "0.1.0"
+version = "0.1.2"
 min_herdr_version = "0.9.5"
 description = "Set each tab's label to the terminal title of the tab's active pane."
 platforms = ["linux", "macos"]
