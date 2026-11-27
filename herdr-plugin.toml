@@ -1,70 +1,37 @@
-id = "davidolrik.titles"
-name = "Herdr Titles"
-version = "0.16.0"
-# [[startup]] delivery requires herdr 0.7.5; everything else works on 0.7.1.
-min_herdr_version = "0.8.2"
-description = " Titles that keep up. herdr-titles names your tabs after what's actually running — including your AI agents' live session titles — and composes the window title from workspace, tab, agent-attention counts, and your shell environment via a small HCL template. Instant, self-healing, near-zero CPU. Zero config to start, endlessly tweakable."
+id = "chriszarate.titles"
+name = "Terminal titles"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Set each tab's label to the terminal title of the tab's active pane."
 platforms = ["linux", "macos"]
 
-# Downloads the prebuilt, checksum-verified release binary for this version
-# and platform (needs only sh + curl); falls back to `go build` for dev
-# checkouts and platforms without a release asset.
+# `herdr plugin link` does not run this step: build by hand after a change.
 [[build]]
-command = ["sh", "scripts/fetch-or-build.sh"]
+command = ["go", "build", "-o", "bin/herdr-titles", "."]
 platforms = ["linux", "macos"]
-
-# One idempotent reconcile handles every trigger: read config, harvest env,
-# snapshot herdr, evaluate the template, push the title only when it changed.
-# The event name is argv[1] for logging; it does not alter behavior, except
-# "refresh" which bypasses the shell-environment cache.
-[[startup]]
-command = ["./bin/herdr-titles", "startup"]
 
 # The watch daemon: subscribes to the session's socket event stream (incl.
-# pane.updated, which plugin hooks can't receive) and drives all reconciles.
-# The spawned process daemonizes immediately so no plugin slot stays pinned.
+# pane.updated, which plugin hooks can't receive) and syncs the tab labels
+# after every burst of events. The spawned process daemonizes immediately so
+# no plugin slot stays pinned.
 [[startup]]
 command = ["./bin/herdr-titles", "watch"]
 
-# Watchdog hooks: the watch daemon handles all events over the socket
-# stream. These three low-volume hooks exist to DETECT a dead daemon (flock
-# probe) and revive it, covering the gap with an inline reconcile; with a
-# live daemon they exit immediately.
+# Watchdog hooks: the daemon handles all events over the socket stream. These
+# two low-volume hooks exist to DETECT a dead daemon (flock probe) and revive
+# it; with a live daemon they exit immediately.
 [[events]]
 on = "workspace.focused"
-command = ["./bin/herdr-titles", "workspace.focused"]
+command = ["./bin/herdr-titles", "watchdog"]
 
 [[events]]
 on = "tab.focused"
-command = ["./bin/herdr-titles", "tab.focused"]
+command = ["./bin/herdr-titles", "watchdog"]
 
-[[events]]
-on = "pane.agent_status_changed"
-command = ["./bin/herdr-titles", "pane.agent_status_changed"]
-
-# Refresh every running herdr session's titles with a fresh environment —
-# for hooks of external tools (Overseer context changes etc.), where the
-# herdr CLI can only reach one session:
-#   ./bin/herdr-titles refresh-all
+# Run one sync pass by hand:
+#   herdr plugin action invoke chriszarate.titles.sync
 [[actions]]
-id = "refresh-all"
-title = "Titles: refresh every session"
+id = "sync"
+title = "Terminal titles: sync tab labels now"
 contexts = ["global"]
-command = ["./bin/herdr-titles", "refresh-all"]
-
-# Re-adopt the invoking tab into automatic naming after a manual rename:
-#   herdr plugin action invoke davidolrik.titles.reset
-[[actions]]
-id = "reset"
-title = "Tab naming: reset tab to automatic naming (rejects a stale terminal title)"
-contexts = ["global"]
-command = ["./bin/herdr-titles", "reset"]
-
-# Write the fully-documented default config into the plugin's config dir
-# (never overwrites an existing config.hcl):
-#   herdr plugin action invoke davidolrik.titles.init-config
-[[actions]]
-id = "init-config"
-title = "Window title: create default config file"
-contexts = ["global"]
-command = ["./bin/herdr-titles", "init-config"]
+command = ["./bin/herdr-titles", "sync"]

@@ -27,8 +27,3 @@ run = "go build -o bin/herdr-titles ."
 [tasks.test]
 description = "🧪 Run the test suite"
 run = "go test ./..."
-
-[tasks.publish]
-alias = "push"
-description = "🚀 Publish to GitHub"
-run = ["git push", "git push --tags"]

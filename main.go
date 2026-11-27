@@ -1,20 +1,18 @@
-// herdr-titles composes the terminal window title from a configurable
-// HCL template fed with herdr state (focused space, focused tab, agent
-// attention counts) and the user's shell environment, then pushes it through
-// `herdr terminal title set`. Herdr spawns it once per subscribed event; every
-// invocation is one idempotent reconcile.
+// herdr-titles sets each herdr tab's label to the terminal title of the tab's
+// active pane, and does nothing else. A per-session daemon (watch.go) follows
+// herdr's event stream and runs one sync pass after every burst of events.
+//
+// Forked from davidolrik/herdr-titles, with the window title, program naming,
+// agent titles, icons, shell hooks, and manual-rename tracking removed.
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
-	"time"
 )
 
-const pluginID = "davidolrik.titles"
+const pluginID = "chriszarate.titles"
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -31,299 +29,47 @@ func defaultDir(kind, name string) string {
 	return filepath.Join(home, kind, name)
 }
 
-// The shell hooks invoke this binary directly, without herdr's HERDR_PLUGIN_*
-// environment, so the fallbacks must name the same directories herdr passes
-// to plugin-spawned runs: its managed per-plugin config and state paths.
-func pluginConfigDir() string {
-	return envOr("HERDR_PLUGIN_CONFIG_DIR",
-		defaultDir(".config", filepath.Join("herdr", "plugins", "config", pluginID)))
-}
-
+// The binary can also be run by hand, without herdr's HERDR_PLUGIN_*
+// environment, so the fallback names the same directory herdr passes to
+// plugin-spawned runs: its managed per-plugin state path.
 func pluginStateDir() string {
 	return envOr("HERDR_PLUGIN_STATE_DIR",
 		defaultDir(".local/state", filepath.Join("herdr", "plugins", pluginID)))
 }
 
-// run wraps one full reconcile in the coalescing lock: event bursts collapse
-// into the lock holder's rerun loop instead of queueing processes.
-func run(event string) error {
-	stateDir := pluginStateDir()
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		return err
-	}
-	session := envOr("HERDR_SESSION", "default")
-	return withLock(stateDir, session, func() error {
-		return pass(event, true, event == "refresh")
-	})
-}
-
-// runTitleOnly is the daemon's cheap pass: window title only, no tab
-// reconcile and therefore no per-tab process-info subprocesses.
-func runTitleOnly(event string, bypassEnvCache bool) error {
-	stateDir := pluginStateDir()
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		return err
-	}
-	session := envOr("HERDR_SESSION", "default")
-	return withLock(stateDir, session, func() error {
-		return pass(event, false, bypassEnvCache)
-	})
-}
-
-// pass is one idempotent reconcile: optionally tabs, then the window title.
-// The caller holds the per-session lock.
-func pass(event string, withTabs, bypassEnvCache bool) error {
-	configDir := pluginConfigDir()
-	stateDir := pluginStateDir()
-
-	cfg, err := LoadConfig(filepath.Join(configDir, "config.hcl"))
-	if err != nil {
-		return err
-	}
-
-	// A cache bypass picks up external changes (the refresh action, or the
-	// daemon noticing a watched env file change).
-	harvested, err := HarvestEnv(cfg.EnvCommand, filepath.Join(stateDir, "env.cache"), cfg.EnvTTL, bypassEnvCache)
-	if err != nil {
-		return err
-	}
-	// The harvested shell environment wins; the process env fills in what only
-	// the plugin engine knows (HERDR_* variables).
-	env := map[string]string{}
-	for _, entry := range os.Environ() {
-		for i := 0; i < len(entry); i++ {
-			if entry[i] == '=' {
-				env[entry[:i]] = entry[i+1:]
-				break
-			}
-		}
-	}
-	for k, v := range harvested {
-		env[k] = v
-	}
-
+// runSync is one idempotent pass: snapshot the session, and rename every tab
+// whose label differs from its active pane's terminal title.
+func runSync() error {
 	sock := sessionSocketPath()
 	snap, err := FetchSnapshot(sock)
 	if err != nil {
 		return err
 	}
-
-	session := envOr("HERDR_SESSION", "default")
-
-	// Tabs first, so the window title's ${tab} sees the fresh label. The
-	// reset action re-adopts the invoking tab regardless of its opt-out.
-	if withTabs && cfg.Tabs.Enabled {
-		forceTab := ""
-		if event == "reset" {
-			forceTab = envOr("HERDR_TAB_ID", contextTabID())
-			if forceTab == "" {
-				forceTab = snap.FocusedTabID
-			}
-		}
-		statePath := tabStatePath(stateDir, session)
-		tabStates := LoadTabStates(statePath)
-		ReconcileTabs(sock, snap, cfg.Tabs, tabStates, forceTab)
-		if err := SaveTabStates(statePath, tabStates); err != nil {
-			return err
-		}
-	}
-
-	title, err := ComposeTitle(cfg, snap, session, env)
-	if err != nil {
-		return err
-	}
-
-	// The state dir is shared by every herdr session's server, so the record
-	// of the last pushed title must be kept per session.
-	_, err = ApplyTitle(sock, filepath.Join(stateDir, "last_title."+session), title)
-	return err
-}
-
-// contextTabID pulls the invoking tab out of herdr's action context JSON.
-func contextTabID() string {
-	var ctx struct {
-		TabID string `json:"tab_id"`
-	}
-	if err := json.Unmarshal([]byte(os.Getenv("HERDR_PLUGIN_CONTEXT_JSON")), &ctx); err != nil {
-		return ""
-	}
-	return ctx.TabID
-}
-
-// runFast is the shell-hook path: rename just the invoking tab, right now.
-// mode "preexec" carries the typed command line (plus a "shell" marker when
-// the word is a construct and the pane's real process must be sampled); mode
-// "precmd" means back-at-the-prompt, optionally naming the hook's shell.
-func runFast(mode string, args []string) error {
-	tabID := os.Getenv("HERDR_TAB_ID")
-	if tabID == "" {
-		return nil // not inside a herdr pane
-	}
-	cfg, err := LoadConfig(filepath.Join(pluginConfigDir(), "config.hcl"))
-	if err != nil {
-		return err
-	}
-	tabs := cfg.Tabs
-	if !tabs.Enabled {
-		return nil
-	}
-
-	var prog, cmdline string
-	sampled := false
-	switch mode {
-	case "preexec":
-		if len(args) == 0 {
-			return nil
-		}
-		cmdline = args[0]
-		if len(args) > 1 && args[1] == "shell" {
-			sampled = true
-		} else {
-			prog = cmdline
-			if i := strings.IndexByte(prog, ' '); i >= 0 {
-				prog = prog[:i]
-			}
-			if i := strings.LastIndex(prog, "/"); i >= 0 {
-				prog = prog[i+1:]
-			}
-		}
-	case "precmd":
-		if len(args) > 0 && args[0] != "" {
-			tabs.ShellName = args[0]
-		}
-	}
-
-	// The shell construct just started; give the real foreground process a
-	// beat to appear. Deliberately before taking the lock. Under terminal
-	// titles the same beat lets herdr parse the title the integration just
-	// published, and lets a titleless pane's command exec, before the
-	// snapshot below is taken.
-	if sampled || tabs.TerminalTitles {
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	stateDir := pluginStateDir()
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
-		return err
-	}
-	session := envOr("HERDR_SESSION", "default")
-
-	// Every shell prompt is a chance to revive a dead watch daemon.
-	ensureDaemon(stateDir, session)
-
-	// Under terminal titles the daemon is the writer for titled panes: it
-	// applies the pane.updated stream (config guarantees watch_titles is on),
-	// and every rename the plugin makes fires tab.renamed, which schedules a
-	// full pass that recomputes the tab from the pane's title — so a hook
-	// rename derived from anything BUT the title would be undone a moment
-	// later, and the two must never diverge. Herdr has no "foreground command
-	// changed" event, so the program a command starts is conveyed through the
-	// pane's TITLE: the shell integration publishes it at preexec (see
-	// shell/hook.*), and a program that sets its own title (nvim) overrides
-	// it moments later. But a pane that publishes no title at all — a shell
-	// without the integration, HERDR_TITLES_NO_TITLE=1, a command whose first
-	// word is a function or an assignment — has no stream to speak for it,
-	// and would change its tab only on some unrelated event's full pass: a
-	// command that ended in a background tab kept the tab until it was next
-	// focused. So the hook reconciles its own tab from a fresh snapshot,
-	// computing exactly what the next full pass would (titles win, so it can
-	// never disagree with the daemon; process-info only for an untitled
-	// pane). A rerun raised meanwhile escalates to a full reconcile, which is
-	// a superset — a rename the daemon handed over is not lost.
-	if tabs.TerminalTitles {
-		first := true
-		return withLock(stateDir, session, func() error {
-			if !first {
-				return pass("rerun", true, false)
-			}
-			first = false
-			return ReconcileTabByID(sessionSocketPath(), tabStatePath(stateDir, session), tabID, tabs)
-		})
-	}
-
-	// First pass under the lock is the single-tab fast rename; any rerun flag
-	// raised meanwhile escalates to a full reconcile, which is a superset —
-	// a structural event that raced this hook still gets handled.
-	first := true
-	return withLock(stateDir, envOr("HERDR_SESSION", "default"), func() error {
-		if !first {
-			return pass("rerun", true, false)
-		}
-		first = false
-
-		sock := sessionSocketPath()
-		if sampled {
-			p, c, err := paneProgram(sock, os.Getenv("HERDR_PANE_ID"))
-			if err != nil || p == "" {
-				return nil // never guess
-			}
-			prog, cmdline = p, c
-		}
-
-		name := FormatTabName(prog, cmdline, tabs)
-		if name == "" && !tabs.HideShell {
-			return nil
-		}
-		label, ok := tabLabel(sock, tabID)
-		if !ok {
-			return nil
-		}
-
-		statePath := tabStatePath(stateDir, envOr("HERDR_SESSION", "default"))
-		states := LoadTabStates(statePath)
-		if !states.Eligible(tabID, label, name, false) {
-			return SaveTabStates(statePath, states) // Eligible may record an opt-out
-		}
-		if name != label {
-			renameTab(sock, tabID, name)
-		}
-		states[tabID] = TabState{Auto: name, Enabled: true}
-		return SaveTabStates(statePath, states)
-	})
-}
-
-// runInit writes the documented default config file and reports where.
-func runInit() error {
-	path, err := WriteDefaultConfig(pluginConfigDir())
-	if err != nil {
-		return err
-	}
-	fmt.Printf("wrote %s\n", path)
-	return nil
+	return SyncTabs(sock, snap, maxLabelLen)
 }
 
 func main() {
-	event := "startup"
+	command := "sync"
 	if len(os.Args) > 1 {
-		event = os.Args[1]
+		command = os.Args[1]
 	}
 	var err error
-	switch event {
-	case "init-config":
-		err = runInit()
-	case "init":
-		err = runShellInit(os.Args[2:])
-	case "refresh-all":
-		err = runRefreshAll()
+	switch command {
+	case "sync":
+		err = runSync()
 	case "watch":
 		if len(os.Args) > 2 && os.Args[2] == "--detached" {
 			err = runWatchDetached()
 		} else {
 			err = runWatchParent()
 		}
-	case "workspace.focused", "tab.focused":
-		// Watchdog hooks: a live daemon already handles the event; a dead
-		// one is revived and the gap covered.
-		err = runWatchdog(event)
-	case "pane.agent_status_changed":
-		err = runStatusHook(event)
-	case "preexec", "precmd":
-		err = runFast(event, os.Args[2:])
+	case "watchdog":
+		err = runWatchdog()
 	default:
-		err = run(event)
+		err = fmt.Errorf("unknown command (want sync, watch, or watchdog)")
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "herdr-titles (%s): %v\n", event, err)
+		fmt.Fprintf(os.Stderr, "herdr-titles %s: %v\n", command, err)
 		os.Exit(1)
 	}
 }

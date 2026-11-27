@@ -1,8 +1,6 @@
 package main
 
-// Direct client for herdr's session API socket. Every pass used to fork+exec
-// the herdr CLI for its I/O (snapshot, tab get/rename, title set,
-// process-info); that overhead dwarfed the actual work. The protocol is
+// Direct client for herdr's session API socket. The protocol is
 // newline-delimited JSON — one request line, one response line — and dialing
 // a unix socket costs microseconds, so each request simply dials fresh: no
 // pooling, no reconnect state, nothing to go stale.

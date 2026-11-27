@@ -1,663 +1,483 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
+	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
+	"reflect"
+	"sync"
 	"testing"
+	"time"
 )
 
-// fixtureSnapshotResult loads testdata/snapshot.json (a full CLI-era
-// response) and returns its result payload, the shape session.snapshot
-// serves over the socket.
-func fixtureSnapshotResult(t *testing.T) json.RawMessage {
+// fakeHerdr is a minimal stand-in for herdr's session socket. It serves
+// session.snapshot from the current tabs and panes, applies tab.rename to
+// them, and pushes event lines to every subscriber.
+type fakeHerdr struct {
+	t        *testing.T
+	path     string
+	listener net.Listener
+
+	mu       sync.Mutex
+	tabs     []map[string]any
+	panes    []map[string]any
+	layouts  []map[string]any
+	renames  []string // "tab_id=label", in order
+	subs     []net.Conn
+	subbed   chan struct{}
+	snapFail int // fail this many snapshot requests first
+}
+
+func newFakeHerdr(t *testing.T) *fakeHerdr {
 	t.Helper()
-	data, err := os.ReadFile("testdata/snapshot.json")
+	// A unix socket path has a short length limit, so not t.TempDir().
+	dir, err := os.MkdirTemp("/tmp", "ht")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var full struct {
-		Result json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal(data, &full); err != nil {
-		t.Fatal(err)
-	}
-	// The protocol is line-framed: the fixture's pretty-printed JSON must be
-	// compacted to a single line before a fake server may serve it.
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, full.Result); err != nil {
-		t.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-func TestApplyTitleSetsOnlyWhenChanged(t *testing.T) {
-	api := newFakeAPI(t)
-	statePath := filepath.Join(t.TempDir(), "last_title")
-
-	changed, err := ApplyTitle(api.sockPath, statePath, "hello")
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "s")
+	l, err := net.Listen("unix", path)
 	if err != nil {
-		t.Fatalf("ApplyTitle: %v", err)
-	}
-	if !changed {
-		t.Error("first ApplyTitle reported unchanged")
-	}
-
-	changed, err = ApplyTitle(api.sockPath, statePath, "hello")
-	if err != nil {
-		t.Fatalf("second ApplyTitle: %v", err)
-	}
-	if changed {
-		t.Error("second ApplyTitle with same title reported changed")
-	}
-
-	titleSets, _, _ := api.recorded()
-	if len(titleSets) != 1 || titleSets[0] != "hello" {
-		t.Errorf("title sets = %v, want exactly one 'hello'", titleSets)
-	}
-}
-
-// TestEndToEnd builds the real binary and runs it against a fake API socket,
-// asserting the full pipeline: config load, env harvest, snapshot fetch,
-// template evaluation, and set-only-when-changed.
-func TestEndToEnd(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	build := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-
-	api := newFakeAPI(t)
-	api.mu.Lock()
-	api.snapshot = fixtureSnapshotResult(t)
-	api.mu.Unlock()
-
-	configDir := filepath.Join(dir, "config")
-	stateDir := filepath.Join(dir, "state")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	config := `
-template = "${session}|${workspace}|${tab}|${attention}|${getenv("E2E_MARKER")}"
-
-env {
-  command = ["/bin/sh", "-c", "printf 'E2E_MARKER=live\\0'"]
-  ttl     = "1h"
+	f := &fakeHerdr{t: t, path: path, listener: l, subbed: make(chan struct{}, 8)}
+	t.Cleanup(f.close)
+	go f.serve()
+	return f
 }
 
-attention {
-  statuses = ["working"]
-  icons    = { working = "W" }
-}
-
-tabs {
-  enabled      = false # keep this test to the window-title path
-  watch_titles = false # and keep watchdogs from spawning daemons at the fake
-}
-`
-	if err := os.WriteFile(filepath.Join(configDir, "config.hcl"), []byte(config), 0o644); err != nil {
-		t.Fatal(err)
+func (f *fakeHerdr) close() {
+	f.listener.Close()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.subs {
+		c.Close()
 	}
+	f.subs = nil
+}
 
-	run := func(event string) {
-		t.Helper()
-		cmd := exec.Command(bin, event)
-		cmd.Env = append(os.Environ(),
-			"HERDR_PLUGIN_CONFIG_DIR="+configDir,
-			"HERDR_PLUGIN_STATE_DIR="+stateDir,
-			"HERDR_SESSION=testsess",
-			"HERDR_SOCKET_PATH="+api.sockPath,
-		)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("binary run (%s): %v\n%s", event, err, out)
+func (f *fakeHerdr) serve() {
+	for {
+		conn, err := f.listener.Accept()
+		if err != nil {
+			return
 		}
-	}
-
-	run("tab.focused")
-
-	want := "testsess|herdr-overseer|1|W1|live"
-	titleSets, _, snapshots := api.recorded()
-	if snapshots != 1 || len(titleSets) != 1 || titleSets[0] != want {
-		t.Fatalf("after first run: snapshots=%d titleSets=%v, want 1 snapshot and [%s]", snapshots, titleSets, want)
-	}
-
-	// Second run: same snapshot, so the title must not be set again.
-	run("pane.agent_status_changed")
-	titleSets, _, snapshots = api.recorded()
-	if snapshots != 2 || len(titleSets) != 1 {
-		t.Errorf("after second run: snapshots=%d titleSets=%v, want one extra snapshot only", snapshots, titleSets)
-	}
-
-	// State is per-session: several herdr sessions share one state dir, and one
-	// session's record must never suppress another session's push.
-	if _, err := os.Stat(filepath.Join(stateDir, "last_title.testsess")); err != nil {
-		t.Errorf("per-session state file missing: %v", err)
+		go f.handle(conn)
 	}
 }
 
-// requireShell skips the test when shell is not installed: the emitted
-// integration is proven live in zsh/bash/fish where they exist (a dev
-// machine, macOS CI); a Linux runner without zsh must not fail on that.
-func requireShell(t *testing.T, shell string) {
-	t.Helper()
-	if _, err := exec.LookPath(shell); err != nil {
-		t.Skipf("%s not installed", shell)
-	}
-}
-
-// init-config writes the documented default config (the init-config action).
-// The bare `init` verb belongs to the shell integration (`init <shell>`), so
-// with no shell it must fail with usage rather than silently write a config.
-func TestInitConfigSubcommand(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	build := exec.Command("go", "build", "-o", bin, ".")
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	configDir := filepath.Join(dir, "config")
-
-	cmd := exec.Command(bin, "init-config")
-	cmd.Env = append(os.Environ(), "HERDR_PLUGIN_CONFIG_DIR="+configDir)
-	out, err := cmd.CombinedOutput()
+func (f *fakeHerdr) handle(conn net.Conn) {
+	line, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		t.Fatalf("init-config: %v\n%s", err, out)
+		conn.Close()
+		return
 	}
-	wantPath := filepath.Join(configDir, "config.hcl")
-	if !strings.Contains(string(out), wantPath) {
-		t.Errorf("init-config output %q does not mention %q", out, wantPath)
+	var req struct {
+		Method string         `json:"method"`
+		Params map[string]any `json:"params"`
 	}
-	if _, err := os.Stat(wantPath); err != nil {
-		t.Fatalf("config.hcl not created: %v", err)
-	}
+	_ = json.Unmarshal([]byte(line), &req)
 
-	// Second invocation refuses to overwrite and exits non-zero.
-	cmd = exec.Command(bin, "init-config")
-	cmd.Env = append(os.Environ(), "HERDR_PLUGIN_CONFIG_DIR="+configDir)
-	if out, err := cmd.CombinedOutput(); err == nil {
-		t.Fatalf("second init-config succeeded, want refusal; output: %s", out)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	reply := func(v any) {
+		data, _ := json.Marshal(v)
+		conn.Write(append(data, '\n'))
 	}
+	switch req.Method {
+	case "events.subscribe":
+		reply(map[string]any{"result": map[string]any{"type": "subscription_started"}})
+		f.subs = append(f.subs, conn)
+		f.subbed <- struct{}{}
+		return // keep the connection open
+	case "session.snapshot":
+		if f.snapFail > 0 {
+			f.snapFail--
+			reply(map[string]any{"error": map[string]any{"code": "busy", "message": "try later"}})
+			break
+		}
+		reply(map[string]any{"result": map[string]any{"snapshot": map[string]any{
+			"tabs": f.tabs, "panes": f.panes, "layouts": f.layouts,
+		}}})
+	case "tab.rename":
+		id, label := req.Params["tab_id"].(string), req.Params["label"].(string)
+		f.renames = append(f.renames, id+"="+label)
+		for _, tab := range f.tabs {
+			if tab["tab_id"] == id {
+				tab["label"] = label
+			}
+		}
+		reply(map[string]any{"result": map[string]any{}})
+	default:
+		reply(map[string]any{"result": map[string]any{}})
+	}
+	conn.Close()
+}
 
-	// Bare `init` is the shell integration and needs a shell: usage error,
-	// no config written.
-	otherDir := filepath.Join(dir, "other")
-	cmd = exec.Command(bin, "init")
-	cmd.Env = append(os.Environ(), "HERDR_PLUGIN_CONFIG_DIR="+otherDir)
-	out, err = cmd.CombinedOutput()
-	if err == nil {
-		t.Fatalf("bare init succeeded, want usage error; output: %s", out)
-	}
-	if !strings.Contains(string(out), "usage") && !strings.Contains(string(out), "init <shell>") {
-		t.Errorf("bare init error %q does not show usage", out)
-	}
-	if _, err := os.Stat(filepath.Join(otherDir, "config.hcl")); err == nil {
-		t.Errorf("bare init wrote a config file")
+// emit pushes one event line to every subscriber.
+func (f *fakeHerdr) emit(event string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.subs {
+		c.Write([]byte(`{"event":"` + event + `","data":{}}` + "\n"))
 	}
 }
 
-// `init <shell>` prints the shell integration for eval: the hook script with
-// THIS binary's absolute path baked in, so the emitted script needs none of
-// the sourced-file self-location the on-disk hooks use (which breaks under
-// eval, where there is no sourced file). Each script must parse under its
-// real shell.
-func TestInitShellEmitsHookWithBinaryPath(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
+func (f *fakeHerdr) update(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn()
+}
+
+func (f *fakeHerdr) renameLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string{}, f.renames...)
+}
+
+// waitRenames waits until the rename log equals want.
+func (f *fakeHerdr) waitRenames(want ...string) {
+	f.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got := f.renameLog()
+		if reflect.DeepEqual(got, want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			f.t.Fatalf("renames = %q, want %q", got, want)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	shells := map[string]struct {
-		check   []string // syntax-check invocation, script on stdin
-		selfLoc string   // sourced-file self-location that must NOT be emitted
+}
+
+func tab(id, label string, panes int, focused bool) map[string]any {
+	return map[string]any{"tab_id": id, "label": label, "pane_count": panes, "focused": focused}
+}
+
+func pane(id, tabID, title string, focused bool) map[string]any {
+	p := map[string]any{"pane_id": id, "tab_id": tabID, "focused": focused}
+	if title != "" {
+		p["terminal_title_stripped"] = title
+	}
+	return p
+}
+
+func layout(tabID, focusedPane string) map[string]any {
+	return map[string]any{"tab_id": tabID, "focused_pane_id": focusedPane}
+}
+
+func snapshotOf(t *testing.T, tabs, panes, layouts []map[string]any) *Snapshot {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{"snapshot": map[string]any{
+		"tabs": tabs, "panes": panes, "layouts": layouts,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := decodeSnapshot(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+func TestDecodeSnapshotRejectsMissingPayload(t *testing.T) {
+	if _, err := decodeSnapshot([]byte(`{}`)); err == nil {
+		t.Fatal("want an error for a response without a snapshot")
+	}
+}
+
+func TestTabName(t *testing.T) {
+	cases := []struct {
+		name    string
+		tab     map[string]any
+		panes   []map[string]any
+		layouts []map[string]any
+		maxLen  int
+		want    string
 	}{
-		"zsh":  {[]string{"zsh", "-n"}, "${(%):-%N}"},
-		"bash": {[]string{"bash", "-n"}, "BASH_SOURCE"},
-		"fish": {[]string{"fish", "--no-execute"}, "status current-filename"},
+		{
+			name:  "single pane names the tab, focused or not",
+			tab:   tab("t1", "1", 1, false),
+			panes: []map[string]any{pane("p1", "t1", "fish ~/code", false)},
+			want:  "fish ~/code",
+		},
+		{
+			name:  "pane without a title leaves the tab alone",
+			tab:   tab("t1", "old", 1, true),
+			panes: []map[string]any{pane("p1", "t1", "", true)},
+			want:  "",
+		},
+		{
+			name:  "whitespace title counts as no title",
+			tab:   tab("t1", "old", 1, true),
+			panes: []map[string]any{pane("p1", "t1", "   ", true)},
+			want:  "",
+		},
+		{
+			name: "multi-pane tab follows the layout's focused pane",
+			tab:  tab("t1", "old", 2, false),
+			panes: []map[string]any{
+				pane("p1", "t1", "vim a.go", false),
+				pane("p2", "t1", "fish ~", false),
+			},
+			layouts: []map[string]any{layout("t1", "p2")},
+			want:    "fish ~",
+		},
+		{
+			name: "another tab's pane never names this tab",
+			tab:  tab("t1", "old", 2, true),
+			panes: []map[string]any{
+				pane("p1", "t1", "vim a.go", false),
+				pane("p2", "t1", "fish ~", false),
+				pane("p9", "t9", "other", true),
+			},
+			layouts: []map[string]any{layout("t1", "p9")},
+			want:    "",
+		},
+		{
+			name: "without layout data the focused tab uses the focused pane",
+			tab:  tab("t1", "old", 2, true),
+			panes: []map[string]any{
+				pane("p1", "t1", "vim a.go", false),
+				pane("p2", "t1", "fish ~", true),
+			},
+			want: "fish ~",
+		},
+		{
+			name: "without layout data a background multi-pane tab is left alone",
+			tab:  tab("t1", "old", 2, false),
+			panes: []map[string]any{
+				pane("p1", "t1", "vim a.go", false),
+				pane("p2", "t1", "fish ~", false),
+			},
+			want: "",
+		},
+		{
+			name:   "max_len cuts by character, not by byte",
+			tab:    tab("t1", "1", 1, true),
+			panes:  []map[string]any{pane("p1", "t1", "héllo wörld", true)},
+			maxLen: 7,
+			want:   "héllo w",
+		},
+		{
+			name:  "no limit by default",
+			tab:   tab("t1", "1", 1, true),
+			panes: []map[string]any{pane("p1", "t1", "a very long terminal title that is not cut", true)},
+			want:  "a very long terminal title that is not cut",
+		},
 	}
-	for shell, want := range shells {
-		t.Run(shell, func(t *testing.T) {
-			out, err := exec.Command(bin, "init", shell).Output()
-			if err != nil {
-				t.Fatalf("init %s: %v", shell, err)
-			}
-			script := string(out)
-			if !strings.Contains(script, bin) {
-				t.Errorf("init %s output does not bake in the binary path %q", shell, bin)
-			}
-			if strings.Contains(script, want.selfLoc) {
-				t.Errorf("init %s output still self-locates via %q", shell, want.selfLoc)
-			}
-			if _, err := exec.LookPath(want.check[0]); err != nil {
-				t.Skipf("%s not installed", want.check[0])
-			}
-			chk := exec.Command(want.check[0], want.check[1:]...)
-			chk.Stdin = strings.NewReader(script)
-			if res, err := chk.CombinedOutput(); err != nil {
-				t.Fatalf("init %s output does not parse under %s: %v\n%s", shell, want.check[0], err, res)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			snap := snapshotOf(t, []map[string]any{c.tab}, c.panes, c.layouts)
+			if got := tabName(snap.Tabs[0], snap, c.maxLen); got != c.want {
+				t.Fatalf("tabName = %q, want %q", got, c.want)
 			}
 		})
 	}
+}
 
-	// Unknown shell: usage error, nothing on stdout.
-	out, err := exec.Command(bin, "init", "tcsh").CombinedOutput()
-	if err == nil {
-		t.Fatalf("init tcsh succeeded; output: %s", out)
+func TestSyncTabsRenamesOnlyTabsThatDiffer(t *testing.T) {
+	f := newFakeHerdr(t)
+	f.tabs = []map[string]any{
+		tab("t1", "stale", 1, true),
+		tab("t2", "fish ~", 1, false),  // already correct
+		tab("t3", "keep me", 1, false), // pane has no title
 	}
-	if !strings.Contains(string(out), "zsh") {
-		t.Errorf("init tcsh error %q does not list supported shells", out)
+	f.panes = []map[string]any{
+		pane("p1", "t1", "vim a.go", true),
+		pane("p2", "t2", "fish ~", false),
+		pane("p3", "t3", "", false),
+	}
+
+	for i := 0; i < 2; i++ { // the second pass must send nothing
+		snap, err := FetchSnapshot(f.path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := SyncTabs(f.path, snap, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, want := f.renameLog(), []string{"t1=vim a.go"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("renames = %q, want %q", got, want)
 	}
 }
 
-// The emitted zsh/bash integration also publishes a pane title every prompt
-// (OSC 2, from the cwd basename by default), because those shells set no
-// terminal title on their own and terminal_titles has nothing to read
-// otherwise. It is user-overridable: define _herdr_titles_title yourself, or
-// set HERDR_TITLES_NO_TITLE=1 to keep your shell's own title. fish already
-// sets a title through fish_title, so its integration only documents that.
-func TestInitShellEmitsTitleSetter(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
+func testTimings() watchTimings {
+	return watchTimings{
+		Debounce:     10 * time.Millisecond,
+		Retry:        20 * time.Millisecond,
+		ReadDeadline: 5 * time.Second,
+		BinaryPoll:   time.Hour,
 	}
-	for _, shell := range []string{"zsh", "bash"} {
-		out, err := exec.Command(bin, "init", shell).Output()
+}
+
+// startDaemon runs watchDaemon against the fake server and returns a channel
+// that yields its result when it exits.
+func startDaemon(t *testing.T, f *fakeHerdr, stateDir string) <-chan error {
+	t.Helper()
+	sync := func() error {
+		snap, err := FetchSnapshot(f.path)
 		if err != nil {
-			t.Fatalf("init %s: %v", shell, err)
+			return err
 		}
-		script := string(out)
-		for _, want := range []string{"_herdr_titles_title", "HERDR_TITLES_NO_TITLE", `\e]2;`} {
-			if !strings.Contains(script, want) {
-				t.Errorf("init %s output lacks %q", shell, want)
-			}
-		}
+		return SyncTabs(f.path, snap, 0)
 	}
-	out, err := exec.Command(bin, "init", "fish").Output()
+	done := make(chan error, 1)
+	go func() { done <- watchDaemon(f.path, stateDir, "test", "", sync, testTimings()) }()
+	return done
+}
+
+func waitDone(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon did not exit")
+		return nil
+	}
+}
+
+func TestWatchDaemonFollowsTitleAndPaneFocus(t *testing.T) {
+	f := newFakeHerdr(t)
+	f.tabs = []map[string]any{tab("t1", "1", 2, true)}
+	f.panes = []map[string]any{
+		pane("p1", "t1", "vim a.go", true),
+		pane("p2", "t1", "fish ~", false),
+	}
+	f.layouts = []map[string]any{layout("t1", "p1")}
+
+	done := startDaemon(t, f, t.TempDir())
+	<-f.subbed
+
+	// The initial pass, with no event at all.
+	f.waitRenames("t1=vim a.go")
+
+	// The active pane's title changes.
+	f.update(func() { f.panes[0]["terminal_title_stripped"] = "vim b.go" })
+	f.emit("pane_updated")
+	f.waitRenames("t1=vim a.go", "t1=vim b.go")
+
+	// Focus moves to the other pane of the same tab.
+	f.update(func() { f.layouts[0]["focused_pane_id"] = "p2" })
+	f.emit("pane_focused")
+	f.waitRenames("t1=vim a.go", "t1=vim b.go", "t1=fish ~")
+
+	// The background pane's title changes: the tab keeps the active pane's.
+	f.update(func() { f.panes[0]["terminal_title_stripped"] = "vim c.go" })
+	f.emit("pane_updated")
+	// Something else renames the tab: the next pass puts the title back.
+	f.update(func() { f.tabs[0]["label"] = "by hand" })
+	f.emit("tab_renamed")
+	f.waitRenames("t1=vim a.go", "t1=vim b.go", "t1=fish ~", "t1=fish ~")
+
+	// The server goes away: the daemon exits cleanly.
+	f.close()
+	if err := waitDone(t, done); err != nil {
+		t.Fatalf("daemon exit: %v", err)
+	}
+}
+
+func TestWatchDaemonRetriesAFailedPass(t *testing.T) {
+	f := newFakeHerdr(t)
+	f.tabs = []map[string]any{tab("t1", "1", 1, true)}
+	f.panes = []map[string]any{pane("p1", "t1", "fish ~", true)}
+	f.snapFail = 2
+
+	done := startDaemon(t, f, t.TempDir())
+	<-f.subbed
+	// No event is sent: only the retry can deliver the rename.
+	f.waitRenames("t1=fish ~")
+
+	f.close()
+	if err := waitDone(t, done); err != nil {
+		t.Fatalf("daemon exit: %v", err)
+	}
+}
+
+func TestWatchDaemonIsASingleton(t *testing.T) {
+	f := newFakeHerdr(t)
+	stateDir := t.TempDir()
+
+	first := startDaemon(t, f, stateDir)
+	<-f.subbed
+	if !daemonAlive(stateDir, "test") {
+		t.Fatal("daemonAlive = false while a daemon holds the lock")
+	}
+
+	// A second daemon for the same session exits at once, without subscribing.
+	if err := waitDone(t, startDaemon(t, f, stateDir)); err != nil {
+		t.Fatalf("second daemon: %v", err)
+	}
+	select {
+	case <-f.subbed:
+		t.Fatal("second daemon subscribed")
+	default:
+	}
+
+	f.close()
+	if err := waitDone(t, first); err != nil {
+		t.Fatalf("first daemon exit: %v", err)
+	}
+	if daemonAlive(stateDir, "test") {
+		t.Fatal("daemonAlive = true after the daemon exited")
+	}
+}
+
+func TestWatchDaemonReportsARejectedSubscription(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "ht")
 	if err != nil {
-		t.Fatalf("init fish: %v", err)
-	}
-	if strings.Contains(string(out), "_herdr_titles_title") {
-		t.Errorf("init fish emits a title setter; fish_title already owns the title")
-	}
-	if !strings.Contains(string(out), "fish_title") {
-		t.Errorf("init fish output does not point at fish_title")
-	}
-
-	requireShell(t, "zsh")
-	// zsh: the default title is the cwd basename; a user-defined
-	// _herdr_titles_title wins; the opt-out defines nothing. An icons-off
-	// config keeps this hermetic (with icons on, `init` bakes the shell's
-	// glyph into the default title — covered by its own test).
-	plainCfg := t.TempDir()
-	if err := os.WriteFile(filepath.Join(plainCfg, "config.hcl"), []byte("template = \"x\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	zsh := func(env, body string) string {
-		t.Helper()
-		cmd := exec.Command("zsh", "-c", env+` eval "$(`+bin+` init zsh)"; `+body)
-		cmd.Env = append(os.Environ(), "HERDR_PLUGIN_CONFIG_DIR="+plainCfg)
-		res, err := cmd.CombinedOutput()
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "s")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		conn, err := l.Accept()
 		if err != nil {
-			t.Fatalf("zsh: %v\n%s", err, res)
+			return
 		}
-		return strings.TrimSpace(string(res))
-	}
-	if got := zsh(`HERDR_PANE_ID=x HERDR_TAB_ID=x`, `cd /tmp && print -r -- "$(_herdr_titles_title)"`); got != "tmp" {
-		t.Errorf("default title = %q, want cwd basename tmp", got)
-	}
-	if got := zsh(`HERDR_PANE_ID=x HERDR_TAB_ID=x`, `_herdr_titles_title() { print mine }; eval "$(`+bin+` init zsh)"; print -r -- "$(_herdr_titles_title)"`); got != "mine" {
-		t.Errorf("user override lost = %q, want mine", got)
-	}
-	if got := zsh(`HERDR_PANE_ID=x HERDR_TAB_ID=x HERDR_TITLES_NO_TITLE=1`, `print -r -- "${+functions[_herdr_titles_precmd]}"`); got != "0" {
-		t.Errorf("opt-out still defined the title precmd: %q", got)
+		bufio.NewReader(conn).ReadString('\n')
+		conn.Write([]byte(`{"error":{"code":"invalid_params","message":"unknown event type"}}` + "\n"))
+		conn.Close()
+	}()
+
+	err = watchDaemon(path, t.TempDir(), "test", "", func() error { return nil }, testTimings())
+	if err == nil {
+		t.Fatal("want an error when the server rejects the subscription")
 	}
 }
 
-// The prompt title the zsh/bash integration publishes carries the SHELL's
-// icon, so a plain-shell tab named after its cwd looks like every other tab
-// (program tabs get their program's icon from the plugin). The shell can't
-// read the HCL config, so `init` bakes the resolved glyph in at emit time —
-// honoring icons.enabled, style, and a custom icons.map entry — and bakes in
-// nothing when icons are off.
-func TestInitShellBakesShellIconIntoPromptTitle(t *testing.T) {
-	requireShell(t, "zsh")
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	sink := filepath.Join(dir, "tty.out")
-	promptTitle := func(config string) string {
-		t.Helper()
-		configDir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(configDir, "config.hcl"), []byte(config), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(sink, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		cmd := exec.Command("zsh", "-c", `eval "$(`+bin+` init zsh)"; cd /tmp; _herdr_titles_precmd; sleep 0.05`)
-		cmd.Env = append(os.Environ(), "HERDR_PANE_ID=x", "HERDR_TAB_ID=x", "HERDR_TITLES_TTY="+sink,
-			"HERDR_PLUGIN_CONFIG_DIR="+configDir, "HERDR_SOCKET_PATH=/nonexistent/herdr.sock")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("zsh: %v\n%s", err, out)
-		}
-		got, _ := os.ReadFile(sink)
-		return string(got)
-	}
-	// Icons on (default style name_and_icon): the builtin zsh glyph + cwd.
-	if got := promptTitle("template = \"x\"\ntabs {\n  icons {\n    enabled = true\n  }\n}\n"); got != "\x1b]2;\ue795 tmp\a" {
-		t.Errorf("icons on: prompt title = %q, want zsh glyph + tmp", got)
-	}
-	// A custom map entry for the shell wins.
-	if got := promptTitle("template = \"x\"\ntabs {\n  icons {\n    enabled = true\n    map = { zsh = \"Z\" }\n  }\n}\n"); got != "\x1b]2;Z tmp\a" {
-		t.Errorf("custom map: prompt title = %q, want Z tmp", got)
-	}
-	// Icons off: bare cwd.
-	if got := promptTitle("template = \"x\"\n"); got != "\x1b]2;tmp\a" {
-		t.Errorf("icons off: prompt title = %q, want bare tmp", got)
-	}
-	// style = "name": no glyph even with icons on.
-	if got := promptTitle("template = \"x\"\ntabs {\n  icons {\n    enabled = true\n    style = \"name\"\n  }\n}\n"); got != "\x1b]2;tmp\a" {
-		t.Errorf("style=name: prompt title = %q, want bare tmp", got)
-	}
-}
+func TestErrorLogSkipsRepeats(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "watch.log")
+	log := &errorLog{path: path}
+	boom := os.ErrDeadlineExceeded
+	log.record(boom)
+	log.record(boom) // repeat: not written
+	log.record(nil)  // success resets the memory
+	log.record(boom) // written again
 
-// Under terminal_titles the program a command starts reaches the tab through
-// the pane TITLE (the daemon is the single writer): the zsh integration's
-// preexec publishes the resolved program name as an OSC 2 title for a real
-// program, and publishes nothing for a builtin/function (cd, z, aliases) so
-// the shell's cwd title stands — no shell-name flash. A program that sets its
-// own title (nvim) simply overrides it moments later.
-func TestInitZshPreexecPublishesProgramTitle(t *testing.T) {
-	requireShell(t, "zsh")
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	// Capture what preexec writes to the terminal by pointing the title
-	// sink at a file: the hook writes titles to $HERDR_TITLES_TTY when set
-	// (a test seam; it defaults to /dev/tty).
-	sink := filepath.Join(dir, "tty.out")
-	run := func(cmdline string) string {
-		t.Helper()
-		if err := os.WriteFile(sink, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		cmd := exec.Command("zsh", "-c",
-			`eval "$(`+bin+` init zsh)"; _hwt_preexec `+shellQuote(cmdline)+` `+shellQuote(cmdline)+`; sleep 0.1`)
-		cmd.Env = append(os.Environ(), "HERDR_PANE_ID=x", "HERDR_TAB_ID=x", "HERDR_TITLES_TTY="+sink,
-			"HERDR_SOCKET_PATH=/nonexistent/herdr.sock")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("zsh: %v\n%s", err, out)
-		}
-		got, _ := os.ReadFile(sink)
-		return string(got)
-	}
-	// `env` exists everywhere (unlike an editor), so the test has no hidden
-	// dependency on what is installed on the machine.
-	if got := run("env FOO=1 true"); got != "\x1b]2;env\a" {
-		t.Errorf("real program: title write = %q, want OSC 2 env", got)
-	}
-	if got := run("/usr/bin/env"); got != "\x1b]2;env\a" {
-		t.Errorf("absolute path: title write = %q, want basename env", got)
-	}
-	// A privilege wrapper's own name says nothing about what is running: the
-	// hook publishes the WHOLE command line and the engine names the wrapped
-	// command from it (FormatTerminalTitle).
-	if _, err := exec.LookPath("sudo"); err == nil {
-		if got := run("sudo env FOO=1"); got != "\x1b]2;sudo env FOO=1\a" {
-			t.Errorf("sudo: title write = %q, want full command line", got)
-		}
-	}
-	if got := run("cd /tmp"); got != "" {
-		t.Errorf("builtin cd: title write = %q, want nothing (cwd title stands)", got)
-	}
-	// Opt-out disables the program title too, not just the prompt title.
-	cmd := exec.Command("zsh", "-c", `eval "$(`+bin+` init zsh)"; _hwt_preexec 'env' 'env'; sleep 0.1`)
-	if err := os.WriteFile(sink, nil, 0o644); err != nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
-	cmd.Env = append(os.Environ(), "HERDR_PANE_ID=x", "HERDR_TAB_ID=x", "HERDR_TITLES_TTY="+sink,
-		"HERDR_TITLES_NO_TITLE=1", "HERDR_SOCKET_PATH=/nonexistent/herdr.sock")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("zsh: %v\n%s", err, out)
-	}
-	if got, _ := os.ReadFile(sink); len(got) != 0 {
-		t.Errorf("HERDR_TITLES_NO_TITLE=1 still published a program title: %q", got)
-	}
-}
-
-func TestFastPath(t *testing.T) {
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-	api := newFakeAPI(t)
-	api.setTab("w1:t1", "")
-	stateDir := filepath.Join(dir, "state")
-	configDir := filepath.Join(dir, "config")
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// watch_titles off so the fast path's daemon probe stays inert.
-	if err := os.WriteFile(filepath.Join(configDir, "config.hcl"),
-		[]byte("template = \"x\"\ntabs { watch_titles = false }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	run := func(args ...string) {
-		t.Helper()
-		cmd := exec.Command(bin, args...)
-		cmd.Env = append(os.Environ(),
-			"HERDR_PLUGIN_CONFIG_DIR="+configDir,
-			"HERDR_PLUGIN_STATE_DIR="+stateDir,
-			"HERDR_SESSION=fastsess",
-			"HERDR_TAB_ID=w1:t1",
-			"HERDR_PANE_ID=w1:p1",
-			"HERDR_SOCKET_PATH="+api.sockPath,
-		)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("binary %v: %v\n%s", args, err, out)
+	lines := 0
+	for _, b := range data {
+		if b == '\n' {
+			lines++
 		}
 	}
-
-	// preexec with a resolvable program: renamed from the typed command line.
-	run("preexec", "nvim main.go")
-	_, renames, _ := api.recorded()
-	if len(renames) != 1 || renames[0] != "w1:t1=nvim" {
-		t.Fatalf("preexec renames = %v, want [w1:t1=nvim]", renames)
-	}
-	if _, err := os.Stat(filepath.Join(stateDir, "tabstate.fastsess.json")); err != nil {
-		t.Fatalf("per-session tab state missing: %v", err)
-	}
-
-	// sampled preexec: the pane's real process wins over the typed word.
-	api.setProcessInfo("w1:p1", "htop", "htop")
-	run("preexec", "some-function", "shell")
-	_, renames, _ = api.recorded()
-	if len(renames) != 2 || renames[1] != "w1:t1=htop" {
-		t.Fatalf("sampled renames = %v, want trailing w1:t1=htop", renames)
-	}
-
-	// precmd: back to the shell name passed by the hook.
-	run("precmd", "fish")
-	_, renames, _ = api.recorded()
-	if len(renames) != 3 || renames[2] != "w1:t1=fish" {
-		t.Fatalf("precmd renames = %v, want trailing w1:t1=fish", renames)
-	}
-
-	// tabs disabled: the fast path must not touch the API at all.
-	if err := os.WriteFile(filepath.Join(configDir, "config.hcl"),
-		[]byte("template = \"x\"\ntabs { enabled = false }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	before := len(renames)
-	run("preexec", "nvim x")
-	_, renames, _ = api.recorded()
-	if len(renames) != before {
-		t.Fatalf("disabled tabs still renamed: %v", renames)
-	}
-
-	// terminal titles with the daemon (watch_titles defaults true): the hook
-	// reconciles ITS OWN tab from a fresh snapshot, computing exactly what a
-	// full pass would — so it can never disagree with the daemon (the single
-	// other writer), yet a pane that publishes no title (a shell without the
-	// integration, HERDR_TITLES_NO_TITLE=1) still follows its foreground
-	// program at preexec and is restored at precmd without waiting for some
-	// unrelated event's full pass. A titled pane is named from its title,
-	// never from process-info. The hook still probes for a dead daemon;
-	// daemonAlive's O_CREATE open leaves the lock file behind, so its
-	// reappearance proves the probe ran.
-	if err := os.WriteFile(filepath.Join(configDir, "config.hcl"),
-		[]byte("template = \"x\"\ntabs { terminal_titles = true }\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	lockPath := filepath.Join(stateDir, "watch.lock.fastsess")
-	if err := os.Remove(lockPath); err != nil {
-		t.Fatalf("lock file missing before terminal-titles run: %v", err)
-	}
-	// The tab is owned from the earlier renames (last set to "fish"); the
-	// snapshot is what the hook reads now.
-	api.setTab("w1:t1", "fish")
-	untitled := singlePaneSnap("fish")
-	api.setSnapshot(t, untitled)
-	api.setProcessInfo("w1:p1", "hx", "hx x")
-	run("preexec", "hx x")
-	_, renames, _ = api.recorded()
-	if len(renames) != before+1 || renames[before] != "w1:t1=hx" {
-		t.Fatalf("terminal_titles=true, untitled pane preexec: renames = %v, want trailing w1:t1=hx", renames)
-	}
-	untitled.Tabs[0].Label = "hx"
-	api.setSnapshot(t, untitled)
-	api.setProcessInfo("w1:p1", "zsh", "-zsh")
-	run("precmd", "zsh")
-	_, renames, _ = api.recorded()
-	if len(renames) != before+2 || renames[before+1] != "w1:t1=zsh" {
-		t.Fatalf("terminal_titles=true, untitled pane precmd: renames = %v, want trailing w1:t1=zsh", renames)
-	}
-	titled := singlePaneSnap("zsh")
-	titled.Panes[0].Title = "user@host: ~/proj"
-	api.setSnapshot(t, titled)
-	api.setProcessInfo("w1:p1", "hx", "hx x")
-	run("preexec", "hx x")
-	run("precmd", "zsh")
-	_, renames, _ = api.recorded()
-	if len(renames) != before+3 || renames[before+2] != "w1:t1=user@host: ~/proj" {
-		t.Fatalf("terminal_titles=true, titled pane: renames = %v, want one trailing rename to the title", renames)
-	}
-	if _, err := os.Stat(lockPath); err != nil {
-		t.Errorf("terminal-titles fast path skipped the daemon probe: %v", err)
-	}
-}
-
-// Inside a LINKED git worktree the default prompt title names the BRANCH
-// behind a tree glyph instead of the directory: worktree managers lay
-// checkouts out as <repo>.<branch>, and a 20-rune tab shows little more than
-// the repo name of that. Detection is pure shell (no git spawn per prompt):
-// a linked worktree's root holds a .git FILE pointing under
-// <main>/.git/worktrees/, and the branch is read from that gitdir's HEAD.
-// The main checkout, a submodule (its .git file points under /modules/)
-// and a detached worktree keep the cwd title. `init` bakes the configured
-// tabs.worktree_icon in under the same rules as the shell's own glyph.
-func TestInitShellPromptTitleNamesWorktree(t *testing.T) {
-	requireShell(t, "git")
-	dir := t.TempDir()
-	bin := filepath.Join(dir, "herdr-titles")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("go build: %v\n%s", err, out)
-	}
-
-	// A real repo with worktrees laid out exactly as `git worktree add` (and
-	// worktrunk) do: siblings of the main checkout, absolute gitdir paths.
-	mainRepo := filepath.Join(dir, "repo")
-	if err := os.MkdirAll(mainRepo, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	git := func(args ...string) {
-		t.Helper()
-		cmd := exec.Command("git", append([]string{"-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
-		cmd.Dir = mainRepo
-		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-	}
-	git("init", "-q", "-b", "main")
-	git("commit", "-q", "--allow-empty", "-m", "init")
-	worktree := filepath.Join(dir, "repo.feature")
-	git("worktree", "add", "-q", "-b", "feature", worktree)
-	nested := filepath.Join(worktree, "sub", "dir")
-	if err := os.MkdirAll(nested, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	detached := filepath.Join(dir, "repo.detached")
-	git("worktree", "add", "-q", "--detach", detached)
-	// A .git file with a RELATIVE gitdir (git itself writes absolute ones,
-	// but the format allows either) resolves against the worktree root.
-	relative := filepath.Join(dir, "relative")
-	if err := os.MkdirAll(relative, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(relative, ".git"), []byte("gitdir: ../repo/.git/worktrees/repo.feature\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A submodule checkout also has a .git file, but under /modules/.
-	submodule := filepath.Join(dir, "submodule")
-	if err := os.MkdirAll(submodule, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(submodule, ".git"), []byte("gitdir: ../repo/.git/modules/submodule\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	sink := filepath.Join(dir, "tty.out")
-	promptTitle := func(shell, config, cwd string) string {
-		t.Helper()
-		configDir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(configDir, "config.hcl"), []byte(config), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(sink, nil, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		cmd := exec.Command(shell, "-c", `eval "$(`+bin+` init `+shell+`)"; cd `+shellQuote(cwd)+`; _herdr_titles_precmd`)
-		cmd.Env = append(os.Environ(), "HERDR_PANE_ID=x", "HERDR_TAB_ID=x", "HERDR_TITLES_TTY="+sink,
-			"HERDR_PLUGIN_CONFIG_DIR="+configDir, "HERDR_SOCKET_PATH=/nonexistent/herdr.sock")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("%s: %v\n%s", shell, err, out)
-		}
-		got, _ := os.ReadFile(sink)
-		return strings.TrimSuffix(strings.TrimPrefix(string(got), "\x1b]2;"), "\a")
-	}
-	iconsOn := "template = \"x\"\ntabs {\n  icons {\n    enabled = true\n  }\n}\n"
-	shellGlyph := map[string]string{"zsh": "", "bash": ""}
-	for _, shell := range []string{"zsh", "bash"} {
-		t.Run(shell, func(t *testing.T) {
-			requireShell(t, shell)
-			cases := []struct{ name, config, cwd, want string }{
-				{"worktree root", iconsOn, worktree, "\U000F0645 feature"},
-				{"worktree subdirectory", iconsOn, nested, "\U000F0645 feature"},
-				{"relative gitdir", iconsOn, relative, "\U000F0645 feature"},
-				{"main checkout", iconsOn, mainRepo, shellGlyph[shell] + " repo"},
-				{"detached worktree", iconsOn, detached, shellGlyph[shell] + " repo.detached"},
-				{"submodule", iconsOn, submodule, shellGlyph[shell] + " submodule"},
-				{"custom glyph", "template = \"x\"\ntabs {\n  worktree_icon = \"W\"\n  icons {\n    enabled = true\n  }\n}\n", worktree, "W feature"},
-				{"glyph disabled", "template = \"x\"\ntabs {\n  worktree_icon = \"\"\n  icons {\n    enabled = true\n  }\n}\n", worktree, "feature"},
-				{"icons off", "template = \"x\"\n", worktree, "feature"},
-				{"style name", "template = \"x\"\ntabs {\n  icons {\n    enabled = true\n    style = \"name\"\n  }\n}\n", worktree, "feature"},
-			}
-			for _, c := range cases {
-				if got := promptTitle(shell, c.config, c.cwd); got != c.want {
-					t.Errorf("%s: prompt title = %q, want %q", c.name, got, c.want)
-				}
-			}
-		})
+	if lines != 2 {
+		t.Fatalf("log has %d lines, want 2:\n%s", lines, data)
 	}
 }
